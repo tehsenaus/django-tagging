@@ -11,6 +11,7 @@ from django.contrib.contenttypes import generic
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models
 from django.db.models.query import QuerySet
+from django.db.models import Count
 from django.utils.translation import ugettext_lazy as _
 
 from tagging import settings
@@ -84,6 +85,8 @@ class TagManager(models.Manager):
 
         model_table = qn(model._meta.db_table)
         model_pk = '%s.%s' % (model_table, qn(model._meta.pk.column))
+        model_ct = ContentType.objects.get_for_model(model)
+    
         query = """
         SELECT DISTINCT %(tag)s.id, %(tag)s.name%(count_sql)s
         FROM
@@ -103,7 +106,7 @@ class TagManager(models.Manager):
             'tagged_item': qn(TaggedItem._meta.db_table),
             'model': model_table,
             'model_pk': model_pk,
-            'content_type_id': ContentType.objects.get_for_model(model).pk,
+            'content_type_id': model_ct.pk,
         }
 
         min_count_sql = ''
@@ -139,14 +142,11 @@ class TagManager(models.Manager):
         of field lookups to be applied to the given Model as the
         ``filters`` argument.
         """
-        if filters is None: filters = {}
 
-        queryset = model._default_manager.filter()
-        for f in filters.items():
-            queryset.query.add_filter(f)
-        usage = self.usage_for_queryset(queryset, counts, min_count)
-
-        return usage
+        queryset = model._default_manager.all()
+        if filters:
+            queryset = queryset.filter(**filters)
+        return self.usage_for_queryset(queryset, counts, min_count)
 
     def usage_for_queryset(self, queryset, counts=False, min_count=None):
         """
@@ -161,24 +161,14 @@ class TagManager(models.Manager):
         greater than or equal to ``min_count`` will be returned.
         Passing a value for ``min_count`` implies ``counts=True``.
         """
-
-        if getattr(queryset.query, 'get_compiler', None):
-            # Django 1.2+
-            compiler = queryset.query.get_compiler(using='default')
-            extra_joins = ' '.join(compiler.get_from_clause()[0][1:])
-            where, params = queryset.query.where.as_sql(
-                compiler.quote_name_unless_alias, compiler.connection
-            )
-        else:
-            # Django pre-1.2
-            extra_joins = ' '.join(queryset.query.get_from_clause()[0][1:])
-            where, params = queryset.query.where.as_sql()
-
-        if where:
-            extra_criteria = 'AND %s' % where
-        else:
-            extra_criteria = ''
-        return self._get_usage(queryset.model, counts, min_count, extra_joins, extra_criteria, params)
+        
+        model_ct = ContentType.objects.get_for_model(queryset.model)
+        qs = self.filter(items__content_type=model_ct, items__object_id__in=queryset.values('pk'))
+        if counts or min_count is not None:
+            qs = qs.annotate(count=Count('items'))
+        if min_count is not None:
+            qs = qs.filter(count__gte=min_count)
+        return qs
 
     def related_for_model(self, tags, model, counts=False, min_count=None):
         """
@@ -238,7 +228,7 @@ class TagManager(models.Manager):
             related.append(tag)
         return related
 
-    def cloud_for_model(self, model, steps=4, distribution=LOGARITHMIC,
+    def cloud_for_model(self, model, steps=4, top=None, distribution=LOGARITHMIC,
                         filters=None, min_count=None):
         """
         Obtain a list of tags associated with instances of the given
@@ -262,10 +252,15 @@ class TagManager(models.Manager):
         To limit the tags displayed in the cloud to those with a
         ``count`` greater than or equal to ``min_count``, pass a value
         for the ``min_count`` argument.
+        
+        To limit the tags displayed in the cloud to the N most popular
+        by ``count``, pass ``top`` = N.
         """
-        tags = list(self.usage_for_model(model, counts=True, filters=filters,
-                                         min_count=min_count))
-        return calculate_cloud(tags, steps, distribution)
+        tags = self.usage_for_model(model, counts=True, filters=filters,
+                                         min_count=min_count)
+        if top is not None:
+            tags = sorted(tags.order_by('-count')[:top], key=lambda t: t.name)
+        return calculate_cloud(list(tags), steps, distribution)
 
 class TaggedItemManager(models.Manager):
     """
